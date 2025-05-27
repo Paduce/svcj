@@ -13,7 +13,7 @@ import pickle
 from svcj.dl.simulator import (
     SVParams, simulate_returns, DT_HOUR
 )
-from svcj.dl.config import get_param_order, get_param_ranges
+from svcj.dl.config import get_param_order, get_param_ranges, sample_parameters_with_feller
 
 __all__ = [
     "SVFamilyDataset", "CachedSVDataset", "BatchSVDataset", 
@@ -36,6 +36,7 @@ class DatasetConfig:
     rho: Optional[float] = None  # If None, samples from [-0.9, 0.9]
     s0: float = 1.0
     v0: Optional[float] = None
+    param_range_source: str = "ficura"
     
     # Dataset behavior - CRITICAL FOR DRIFT SIGNAL PRESERVATION
     return_variance: bool = False
@@ -147,7 +148,8 @@ class SVFamilyDataset(Dataset):
                 mu_mode=mu_mode, dt=dt, rho=rho, s0=1.0, v0=None,
                 return_variance=return_variance, return_jumps=return_jumps,
                 normalize_returns=normalize_returns, standardize_params=standardize_params,
-                seed=seed, deterministic=deterministic
+                seed=seed, deterministic=deterministic,
+                param_range_source=getattr(config, 'param_range_source', 'ficura')
             )
             self.config.validate()
         
@@ -170,7 +172,11 @@ class SVFamilyDataset(Dataset):
         
         # Get ranges properly scaled for our dt
         from svcj.dl.config import get_param_ranges
-        self._param_ranges = get_param_ranges(self.config.model_type, self.config.dt, use_ficura=True)
+        self._param_ranges = get_param_ranges(
+            self.config.model_type, 
+            self.config.dt, 
+            range_source=self.config.param_range_source
+        )
         
         # Validate parameter configuration
         if not self._param_order:
@@ -215,7 +221,11 @@ class SVFamilyDataset(Dataset):
         
         # Simple sampling without Feller condition - using variance flooring instead
         from svcj.dl.config import get_param_ranges
-        dt_ranges = get_param_ranges(self.config.model_type, self.config.dt, use_ficura=True)
+        dt_ranges = get_param_ranges(
+            self.config.model_type, 
+            self.config.dt, 
+            range_source=self.config.param_range_source
+        )
         
         return np.array([
             self.rng.uniform(
@@ -768,6 +778,7 @@ if __name__ == "__main__":
         model_type="svcj",
         return_variance=True,
         normalize_returns=True,
+        param_range_source="default",
         seed=42
     )
     
@@ -785,3 +796,17 @@ if __name__ == "__main__":
     dl = loader(dataset, batch_size=32, num_workers=2)
     batch = next(iter(dl))
     print(f"Batch shapes: {[b.shape for b in batch]}")
+
+    # Example with ficura ranges
+    config_ficura = DatasetConfig(
+        seq_len=252,
+        n_samples=100,
+        model_type="svj",
+        param_range_source="ficura",
+        seed=123
+    )
+    dataset_ficura = SVFamilyDataset(config=config_ficura)
+    sample_ficura = dataset_ficura[0]
+    print(f"Ficura Sample shapes: {[s.shape for s in sample_ficura]}")
+    analysis_ficura = analyze_dataset(dataset_ficura, n_samples=10)
+    print(f"Ficura Success rate: {analysis_ficura['success_rate']:.2%}")

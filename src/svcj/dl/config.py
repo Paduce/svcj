@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -29,47 +28,36 @@ class ParamRange:
 
 
 def convert_param_to_dt(param_name: str, annual_value: float, dt: float) -> float:
-    """
-    Convert an annualized parameter value to the appropriate scale for time step dt.
-    
-    Parameters
-    ----------
-    param_name : str
-        Name of the parameter ('mu', 'v_long', 'beta', 'gamma', 'mu_j', 'sigma_j', 'lambda')
-    annual_value : float
-        The annualized parameter value
-    dt : float
-        Time step (e.g., 1/365 for daily, 1/(365*24) for hourly)
-        
-    Returns
-    -------
-    float
-        Parameter value scaled for the given dt
-    """
-    
     if param_name == "mu":
-        # Drift scales linearly with time
-        return annual_value * dt
+        # Simulator uses: sv_params.mu * dt.
+        # So, sv_params.mu should be the ANNUAL drift rate.
+        return annual_value
     
     elif param_name == "v_long":
-        # Variance scales linearly with time  
-        return annual_value * dt
+        # Simulator uses: kappa * (sv_params.v_long - v_current) * dt.
+        # sv_params.v_long should be the target variance level PER STEP dt.
+        # If annual_value is annual variance, then per-step is annual_value * dt.
+        return annual_value
     
     elif param_name == "beta":
-        # AR(1) coefficient - no scaling needed for discrete time
+        # beta is the per-step AR(1) persistence factor.
+        # Assuming annual_value in FICURA_PARAM_RANGES for beta is already this factor.
         return annual_value
     
     elif param_name == "gamma":
-        # Vol of vol scales with √dt
-        return annual_value * np.sqrt(dt)
-    
-    elif param_name in ["mu_j", "sigma_j"]:
-        # Jump parameters are per jump, no time scaling
+        # Simulator uses: sv_params.gamma * sqrt(v_current) * (random_shock * sqrt(dt)).
+        # So, sv_params.gamma should be the ANNUAL vol-of-vol rate.
         return annual_value
     
-    elif param_name == "lambda":
-        # Jump intensity scales linearly with time
-        return annual_value * dt
+    elif param_name in ["mu_j", "sigma_j"]:
+        # These are per-jump parameters, not rates.
+        # Assuming annual_value in FICURA_PARAM_RANGES for these is the per-jump value.
+        return annual_value
+    
+    elif param_name == "lambda": # Corresponds to 'lam' in SVParams
+        # Simulator uses: sv_params.lam * dt to get jump_prob for the interval dt.
+        # So, sv_params.lam should be the ANNUAL jump intensity rate.
+        return annual_value
     
     else:
         raise ValueError(f"Unknown parameter name: {param_name}")
@@ -140,9 +128,6 @@ DEFAULT_PARAM_RANGES = {
     "lambda": ParamRange(0.5, 50.0),  # 0.5 to 50 jumps per year
 }
 
-# Choose which ranges to use (set to Fičura for replication)
-PARAM_RANGES = FICURA_PARAM_RANGES
-
 # ────────────────────────────────────────────────────────────────────────────
 # Model-specific parameter configurations
 # ────────────────────────────────────────────────────────────────────────────
@@ -167,7 +152,7 @@ def get_param_order(model_type: str = "svcj") -> list[str]:
 
 def get_param_ranges(model_type: str = "svcj", 
                     dt: float = DT_TRADING_DAILY,
-                    use_ficura: bool = True) -> Dict[str, ParamRange]:
+                    range_source: str = "ficura") -> Dict[str, ParamRange]:
     """
     Get parameter ranges for the specified model_type, converted to the given dt.
     
@@ -177,8 +162,8 @@ def get_param_ranges(model_type: str = "svcj",
         Model type ('sv', 'svj', 'svcj')
     dt : float
         Time step (e.g., 1/252 for daily, 1/(365*24) for hourly)
-    use_ficura : bool
-        If True, use Fičura ranges; if False, use broader default ranges
+    range_source : str
+        Source of parameter ranges, e.g., "ficura" or "default"
         
     Returns
     -------
@@ -188,7 +173,12 @@ def get_param_ranges(model_type: str = "svcj",
     order = get_param_order(model_type)
     
     # Choose base ranges
-    base_ranges = FICURA_PARAM_RANGES if use_ficura else DEFAULT_PARAM_RANGES
+    if range_source.lower() == "ficura":
+        base_ranges = FICURA_PARAM_RANGES
+    elif range_source.lower() == "default":
+        base_ranges = DEFAULT_PARAM_RANGES
+    else:
+        raise ValueError(f"Unknown range_source '{range_source}'. Choose from ['ficura', 'default']")
     
     # Convert to dt scale
     converted_ranges = {}
@@ -204,7 +194,7 @@ def get_param_ranges(model_type: str = "svcj",
 def sample_parameters_with_feller(model_type: str = "svcj", 
                                  dt: float = DT_TRADING_DAILY,
                                  size: Union[int, Tuple[int, ...]] = (),
-                                 use_ficura: bool = True,
+                                 range_source: str = "ficura",
                                  seed: int = None,
                                  feller_min: float = 1.0,
                                  max_attempts: int = 1000) -> Dict[str, np.ndarray]:
@@ -222,8 +212,8 @@ def sample_parameters_with_feller(model_type: str = "svcj",
         Time step for parameter scaling
     size : int or tuple
         Shape of samples to generate
-    use_ficura : bool
-        Whether to use Fičura ranges
+    range_source : str
+        Whether to use Fičura or default ranges
     seed : int, optional
         Random seed
     feller_min : float, default=1.0
@@ -239,7 +229,7 @@ def sample_parameters_with_feller(model_type: str = "svcj",
     if seed is not None:
         np.random.seed(seed)
     
-    ranges = get_param_ranges(model_type, dt, use_ficura)
+    ranges = get_param_ranges(model_type, dt, range_source)
     param_order = get_param_order(model_type)
     
     # Handle different size specifications
@@ -347,7 +337,8 @@ def get_dt_from_frequency(frequency: str) -> float:
     return frequency_map[frequency]
 
 
-def validate_parameters(params: Dict[str, float], model_type: str, dt: float) -> bool:
+def validate_parameters(params: Dict[str, float], model_type: str, dt: float,
+                       range_source: str = "ficura") -> bool:
     """
     Validate that parameters are within reasonable bounds for the given dt.
     
@@ -359,13 +350,15 @@ def validate_parameters(params: Dict[str, float], model_type: str, dt: float) ->
         Model type
     dt : float
         Time step
+    range_source : str
+        Source of parameter ranges for validation.
         
     Returns
     -------
     bool
         True if parameters are valid
     """
-    ranges = get_param_ranges(model_type, dt)
+    ranges = get_param_ranges(model_type, dt, range_source=range_source)
     
     for param_name, value in params.items():
         if param_name in ranges:
@@ -377,10 +370,10 @@ def validate_parameters(params: Dict[str, float], model_type: str, dt: float) ->
 
 
 def print_parameter_info(model_type: str = "svcj", dt: float = DT_TRADING_DAILY, 
-                        use_ficura: bool = True):
+                        range_source: str = "ficura"):
     """Print parameter ranges for the given configuration."""
     
-    ranges = get_param_ranges(model_type, dt, use_ficura)
+    ranges = get_param_ranges(model_type, dt, range_source)
     
     freq_name = {
         DT_HOUR: "hourly",
@@ -391,9 +384,15 @@ def print_parameter_info(model_type: str = "svcj", dt: float = DT_TRADING_DAILY,
         DT_ANNUAL: "annual"
     }.get(dt, f"dt={dt}")
     
-    source = "Fičura & Witzany (2023)" if use_ficura else "Default"
-    
-    print(f"\n{model_type.upper()} Parameter Ranges ({source}, {freq_name}):")
+    source_name = ""
+    if range_source.lower() == "ficura":
+        source_name = "Fičura & Witzany (2023)"
+    elif range_source.lower() == "default":
+        source_name = "Default Broad Ranges"
+    else:
+        source_name = f"Custom ({range_source})"
+
+    print(f"\n{model_type.upper()} Parameter Ranges ({source_name}, {freq_name}):")
     print("=" * 60)
     
     for param_name, param_range in ranges.items():
@@ -416,17 +415,24 @@ if __name__ == "__main__":
         ("annual", DT_ANNUAL)
     ]
     
-    for freq_name, dt in frequencies:
-        print(f"\n{freq_name.upper()} (dt = {dt:.6f}):")
-        ranges = get_param_ranges("svcj", dt, use_ficura=True)
-        
-        for param, range_obj in ranges.items():
-            print(f"  {param:>8}: [{range_obj.low:>8.5f}, {range_obj.high:>8.5f}]")
+    for range_src_name in ["ficura", "default"]:
+        print(f"\n--- {range_src_name.upper()} RANGES ---")
+        for freq_name, dt_val in frequencies:
+            print(f"\n{freq_name.upper()} (dt = {dt_val:.6f}):")
+            ranges = get_param_ranges("svcj", dt_val, range_source=range_src_name)
+            
+            for param, range_obj in ranges.items():
+                print(f"  {param:>8}: [{range_obj.low:>8.5f}, {range_obj.high:>8.5f}]")
     
     # Sample some parameters (simple sampling, no Feller condition)
-    print(f"\nSample parameters (trading daily):")
-    samples = sample_parameters("svcj", DT_TRADING_DAILY, size=3, seed=42)
-    for param, values in samples.items():
+    print(f"\nSample parameters (trading daily, ficura):")
+    samples_ficura = sample_parameters_with_feller("svcj", DT_TRADING_DAILY, size=3, seed=42, range_source="ficura")
+    for param, values in samples_ficura.items():
+        print(f"  {param:>8}: {values}")
+
+    print(f"\nSample parameters (trading daily, default):")
+    samples_default = sample_parameters_with_feller("svcj", DT_TRADING_DAILY, size=3, seed=42, range_source="default")
+    for param, values in samples_default.items():
         print(f"  {param:>8}: {values}")
     
-    print(f"\nNote: Feller condition checking removed - using variance flooring in simulation instead.")
+    print(f"\nNote: Feller condition checking is active in sample_parameters_with_feller.")

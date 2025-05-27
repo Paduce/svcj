@@ -118,32 +118,47 @@ class SVParams:
         
         return sv_params
     
+
     def _validate_basic_for_dt(self, dt: float) -> None:
         """
-        Basic validation that parameters are reasonable for the given time step dt.
-        Feller condition checking removed - we use variance flooring instead.
+        Basic validation that parameters (interpreted as annual rates where applicable)
+        are reasonable for the given time step dt.
+        dt is the time step fraction of a year (e.g., 1/250 or 1/365).
         """
-        
-        # Convert to annualized for basic validation
-        annual_mu = self.mu / dt if dt > 0 else float('inf')
-        annual_v_long = self.v_long / dt if dt > 0 else float('inf')
-        annual_lam = self.lam / dt if dt > 0 else float('inf')
-        
-        # Check if annualized values are extremely unreasonable
         warnings_issued = []
-        
-        if abs(annual_mu) > 5.0:  # More than ±500% annual drift
-            warnings_issued.append(f"Extreme annual drift: {annual_mu:.2f}")
-        
-        if annual_v_long > 10.0:  # More than 1000% annual volatility
-            warnings_issued.append(f"Extreme annual variance: {annual_v_long:.2f}")
-        
-        if annual_lam > 1000.0:  # More than 1000 jumps per year
-            warnings_issued.append(f"Extreme annual jump intensity: {annual_lam:.2f}")
-        
+
+        # self.mu is already an annual rate
+        annual_mu_rate = self.mu
+        # Define what you consider an extreme *annual* drift rate.
+        # E.g., Fičura samples annual mu up to 0.1 (10%). Maybe > 0.5 (50%) is extreme.
+        if abs(annual_mu_rate) > 0.5: # Check for > 50% annual drift
+            warnings_issued.append(f"Potentially extreme annual drift rate: {annual_mu_rate:.2f}")
+
+        # self.v_long is the per-step (dt) variance amount.
+        # To get an annualized v_long, we do (self.v_long / dt).
+        annual_v_long_rate = self.v_long / dt if dt > 0 else float('inf')
+        # Fičura samples annual v_long up to ~0.0567. Maybe > 0.2 (20% annual variance) is extreme.
+        if annual_v_long_rate > 1: # Check for > 20% annual variance
+            warnings_issued.append(f"Potentially extreme annual variance rate: {annual_v_long_rate:.2f}")
+
+        # self.lam is already an annual jump intensity rate
+        annual_lam_rate = self.lam
+        # Fičura samples annual lambda up to 12.6. Maybe > 30-50 jumps/year is extreme.
+        if annual_lam_rate > 100.0: # Check for > 40 jumps per year
+            warnings_issued.append(f"Potentially extreme annual jump intensity rate: {annual_lam_rate:.2f}")
+
+        # You might want to add a check for gamma if it's also an annual rate in SVParams
+        # annual_gamma_rate = self.gamma
+        # Fičura samples annual gamma up to ~7.9. Maybe > 10 or 15 is extreme.
+        # if hasattr(self, 'gamma') and self.gamma > 15.0:
+        #     warnings_issued.append(f"Potentially extreme annual vol-of-vol rate: {self.gamma:.2f}")
+
         if warnings_issued:
-            import warnings
-            warning_msg = f"Parameter validation warnings for dt={dt:.6f}: " + "; ".join(warnings_issued)
+            import warnings # Ensure imported
+            # Construct a more informative warning message
+            param_details = f"(SVParams content: mu={self.mu:.4f}, lam={self.lam:.4f}, v_long_step={self.v_long:.6e})"
+            warning_msg = (f"Parameter validation (annualized perspective) warnings for dt={dt:.6f}: "
+                        + "; ".join(warnings_issued) + f" {param_details}")
             warnings.warn(warning_msg, RuntimeWarning)
 
 

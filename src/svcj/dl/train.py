@@ -24,7 +24,7 @@ from svcj.dl.datasets import (
 )
 from svcj.dl.simulator import SVParams, validate_parameters, DT_HOUR
 from svcj.dl.models import build_model                      # unchanged
-from svcj.dl.logger import TBLogger                         # unchanged
+from svcj.dl.logger import TBLogger, spawn_tensorboard_server    # unchanged
 from svcj.dl.config import get_param_order, get_param_ranges
 
 # deterministic cuDNN kernels are slower, but give repeatable results
@@ -52,6 +52,7 @@ class TrainingConfig:
         val_split: float = 0.1,
         dt: float = DT_HOUR,
         rho: Optional[float] = None,
+        param_range_source: str = "ficura",
         
         # Training hyperparameters
         epochs: int = 100,
@@ -74,11 +75,17 @@ class TrainingConfig:
         use_cached_dataset: bool = False,
         cache_path: Optional[str] = None,
         
+        # TensorBoard configuration
+        spawn_tensorboard: bool = True,     # Whether to automatically spawn TensorBoard server
+        tensorboard_port: int = 6006,       # Port for TensorBoard server
+        open_browser: bool = True,          # Whether to automatically open browser
+        
         # System configuration
         device: Optional[str] = None,
         num_workers: int = 4,
         seed: int = 42,
         logdir: str = "runs/sv_family",
+        run_name: Optional[str] = None,     # Optional run name for organizing experiments
         load_checkpoint: bool = False,
     ):
         # Store all parameters
@@ -89,6 +96,7 @@ class TrainingConfig:
         self.val_split = val_split
         self.dt = dt
         self.rho = rho
+        self.param_range_source = param_range_source
         self.epochs = epochs
         self.batch_size = batch_size
         self.lr = lr
@@ -107,8 +115,17 @@ class TrainingConfig:
         self.device = device
         self.num_workers = num_workers
         self.seed = seed
-        self.logdir = logdir
+        self.run_name = run_name
         self.load_checkpoint = load_checkpoint
+        self.spawn_tensorboard = spawn_tensorboard
+        self.tensorboard_port = tensorboard_port
+        self.open_browser = open_browser
+        
+        # Construct final log directory with run name if provided
+        if self.run_name:
+            self.logdir = os.path.join(logdir, self.run_name)
+        else:
+            self.logdir = logdir
         
         self.validate()
     
@@ -361,7 +378,39 @@ def train(config: Optional['TrainingConfig'] = None, **kwargs) -> nn.Module:
     from svcj.dl.datasets import SVFamilyDataset, DatasetConfig
     
     # ─── Setup logging and device ──────────────────────────────────────
-    logger = TBLogger(config.logdir, log_to_file=True)
+    tensorboard_process = None
+    actual_tensorboard_port = config.tensorboard_port # Initialize with configured port
+    if config.spawn_tensorboard:
+        try:
+            # spawn_tensorboard_server now returns a tuple (process, port)
+            tensorboard_process, actual_tensorboard_port = spawn_tensorboard_server(
+                config.logdir, 
+                initial_port=config.tensorboard_port, 
+                open_browser=config.open_browser
+            )
+            if tensorboard_process:
+                print(f"✓ TensorBoard server spawned directly on port {actual_tensorboard_port}")
+            else:
+                print(f"⚠ Failed to spawn TensorBoard server after multiple attempts. Check logs.")
+                # actual_tensorboard_port will remain as config.tensorboard_port if spawning failed
+        except Exception as e:
+            print(f"⚠ Failed to spawn TensorBoard server: {e}")
+            tensorboard_process = None
+            # actual_tensorboard_port remains as config.tensorboard_port
+    
+    # Create logger without spawning TensorBoard (since we did it above or it failed)
+    logger = TBLogger(
+        config.logdir, 
+        log_to_file=True,
+        spawn_tensorboard=False,  # Crucial: prevent TBLogger from trying to spawn again
+        tensorboard_port=actual_tensorboard_port, # Pass the actual port used (or configured if failed)
+        open_browser=False  # Browser opening is handled by the direct call above
+    )
+    
+    # Store the tensorboard process in the logger for cleanup if successfully started
+    if tensorboard_process:
+        logger.tensorboard_process = tensorboard_process
+    
     logger.log_msg(f"==== SV-family Trainer started ({config.model_type.upper()}) ====")
     logger.log_msg(f"Training configuration: {config.__dict__}")
 
@@ -394,6 +443,7 @@ def train(config: Optional['TrainingConfig'] = None, **kwargs) -> nn.Module:
             rho=config.rho,
             s0=1.0,
             v0=None,
+            param_range_source=config.param_range_source,
             return_variance=config.return_variance,
             return_jumps=config.return_jumps,
             normalize_returns=config.normalize_returns,
@@ -518,17 +568,18 @@ def train(config: Optional['TrainingConfig'] = None, **kwargs) -> nn.Module:
 
     # ─── Model creation and validation ──────────────────────────────────
     try:
-        model = build_model(config.arch, model_type=config.model_type).to(device)
+        model = build_model(config.arch, model_type=config.model_type, seq_len=config.seq_len).to(device)
         
-        # Validate model architecture
-        validate_model_architecture(
-            model, sample_returns[:1], effective_n_params, 
-            config.mu_mode, device
-        )
+        # Validate model architecture # MOVED DOWN
+        # validate_model_architecture(
+        #     model, sample_returns[:1], effective_n_params, 
+        #     config.mu_mode, device
+        # )
         
-        n_params = sum(p.numel() for p in model.parameters())
-        logger.log_msg(f"Model created: {n_params:,} parameters")
-        
+        # n_params = sum(p.numel() for p in model.parameters()) # MOVED DOWN
+        # logger.log_msg(f"Model created: {n_params:,} parameters")
+        logger.log_msg(f"Model structure built for arch='{config.arch}', type='{config.model_type}'. Validation and lazy init will occur after checkpoint load attempt.")
+
     except Exception as e:
         logger.log_msg(f"Error creating model: {e}", level=40)
         raise
@@ -578,15 +629,36 @@ def train(config: Optional['TrainingConfig'] = None, **kwargs) -> nn.Module:
             if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                 model.load_state_dict(checkpoint['model_state_dict'])
                 best_val_loss = checkpoint.get('best_val_loss', float("inf"))
-                logger.log_msg(f"Loaded checkpoint with val_loss={best_val_loss:.3e}")
+                loaded_epoch = checkpoint.get('epoch', 'N/A')
+                logger.log_msg(f"Loaded checkpoint (epoch {loaded_epoch}) with val_loss={best_val_loss:.3e}")
             else:
-                model.load_state_dict(checkpoint)
+                model.load_state_dict(checkpoint) # Legacy format
                 logger.log_msg("Loaded checkpoint (legacy format)")
+            logger.log_msg("✓ Checkpoint loaded successfully.")
         except Exception as e:
-            logger.log_msg(f"Error loading checkpoint: {e}", level=30)
-            logger.log_msg("Training from scratch")
+            logger.log_msg(f"⚠ Error loading checkpoint: {e}", level=30)
+            logger.log_msg("Proceeding with fresh model or partially loaded state.")
     else:
-        logger.log_msg("Training from scratch")
+        logger.log_msg("No checkpoint found or load_checkpoint=False. Training from scratch or existing model state.")
+
+    # ─── Initialize Lazy Layers (if any) and Validate Architecture ────────────────
+    # This must happen AFTER attempting to load checkpoint, and BEFORE training.
+    try:
+        logger.log_msg("Validating model architecture and initializing lazy layers (if any)...")
+        validate_model_architecture(
+            model, sample_returns[:1], effective_n_params,
+            config.mu_mode, device
+        )
+        n_model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.log_msg(f"✓ Model architecture validated. Trainable parameters: {n_model_params:,}")
+        # Log total params as well for completeness
+        total_params = sum(p.numel() for p in model.parameters())
+        if total_params != n_model_params:
+            logger.log_msg(f"Total parameters (including non-trainable): {total_params:,}")
+
+    except Exception as e:
+        logger.log_msg(f"Error validating model architecture post-checkpoint load/model creation: {e}", level=40)
+        raise
 
     # ─── Training loop ──────────────────────────────────────────────────
     try:
@@ -647,7 +719,7 @@ def train(config: Optional['TrainingConfig'] = None, **kwargs) -> nn.Module:
                 })
             
             avg_train_loss = train_loss_accum / train_batches
-            logger.log(epoch, avg_train_loss, "train/loss")
+            logger.log(epoch, avg_train_loss, "loss/train")
             
             # ----- Validation phase ----------------------------------------
             if epoch % config.validate_every == 0:
@@ -657,13 +729,28 @@ def train(config: Optional['TrainingConfig'] = None, **kwargs) -> nn.Module:
                     )
                     
                     # Logging
-                    logger.log(epoch, avg_val_loss, "val/loss")
+                    logger.log(epoch, avg_val_loss, "loss/val")
                     logger.log(epoch, r2_global, "val/R2_global")
                     
                     for i, r2p in enumerate(r2_per_param):
-                        logger.log(epoch, r2p.item(), f"val/R2_param_{i}")
+                        # logger.log(epoch, r2p.item(), f"val/R2_param_{i}") # Removed as per user request
                         if i < len(param_order):
-                            param_name = param_order[i] if config.mu_mode == "raw" else param_order[i+1]
+                            # Determine the correct parameter name based on mu_mode
+                            # If mu_mode is 'analytical', param_order used for y_mean/y_std is already shifted,
+                            # but the original param_order (for naming) includes mu at index 0.
+                            # The r2_per_param corresponds to the effective parameters predicted by the model.
+                            if config.mu_mode == "analytical":
+                                # r2_per_param[0] is for param_order[1], r2_per_param[1] is for param_order[2], etc.
+                                if (i + 1) < len(param_order):
+                                    param_name = param_order[i+1]
+                                else:
+                                    param_name = f"unknown_param_idx_{i+1}" # Should not happen if dimensions match
+                            else: # mu_mode is 'raw' or 'devol'
+                                # r2_per_param[0] is for param_order[0] (mu), etc.
+                                if i < len(param_order):
+                                    param_name = param_order[i]
+                                else:
+                                    param_name = f"unknown_param_idx_{i}" # Should not happen
                             logger.log(epoch, r2p.item(), f"val/R2_{param_name}")
                     
                     logger.log_msg(
@@ -903,6 +990,8 @@ def train_sv_model(
     mu_mode: str = "raw",
     load_checkpoint: bool = False,
     seed: int = 42,
+    run_name: Optional[str] = None,
+    param_range_source: str = "ficura",
     **kwargs
 ) -> nn.Module:
     """
@@ -914,7 +1003,9 @@ def train_sv_model(
         logdir=logdir, device=device, val_split=val_split, 
         early_stop_patience=early_stop_patience, num_workers=num_workers,
         mixed_precision=mixed_precision, mu_mode=mu_mode, 
-        load_checkpoint=load_checkpoint, seed=seed, **kwargs
+        load_checkpoint=load_checkpoint, seed=seed, run_name=run_name,
+        param_range_source=param_range_source,
+        **kwargs
     )
     
     return train(config)
@@ -923,13 +1014,16 @@ def train_sv_model(
 if __name__ == "__main__":
     # Example: Proper configuration for preserving drift signal (μ estimation)
     config = TrainingConfig(
-        arch="cnn_ficura",
+        arch="transformer",
         model_type="svj",
-        dt=1.0/365  ,              # 1/252 - auto-converts annualized ranges
-        seq_len=2000,               # Their sequence length
-        n_samples=10_000,           # Their training size
-        batch_size=512,             # Their batch size
+        dt=1.0/(365*24)  ,              # 1/252 - auto-converts annualized ranges
+        seq_len=90*28,               # Their sequence length
+        n_samples=500_000,           # Their training size
+        batch_size=256,             # Their batch size
         mu_mode="raw",              # Predict all parameters including μ
+        param_range_source="default",
+        run_name="svj_transformer_huge_run",
+        device="cuda",
         
         # CRITICAL: Preserve drift signal for μ estimation
         normalize_returns=False,    # No per-series centering in dataset
